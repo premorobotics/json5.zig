@@ -54,8 +54,8 @@ else
     void = if (build_mode_has_safety) .none else {},
 
 const build_mode_has_safety = switch (@import("builtin").mode) {
-    .Debug, .ReleaseSafe => true,
-    .ReleaseFast, .ReleaseSmall => false,
+    .debug, .safe => true,
+    .fast, .small => false,
 };
 
 /// The `safety_checks_hint` parameter determines how much memory is used to enable assertions that the above grammar is being followed,
@@ -66,7 +66,7 @@ const build_mode_has_safety = switch (@import("builtin").mode) {
 /// If `.checked_to_fixed_depth` is used, there is additionally an assertion that the nesting depth never exceeds the given limit.
 /// `.checked_to_fixed_depth` embeds the storage required in the `Stringify` struct.
 /// `.assumed_correct` requires no space and performs none of these assertions.
-/// In `ReleaseFast` and `ReleaseSmall` mode, the given `safety_checks_hint` is ignored and is always treated as `.assumed_correct`.
+/// In fast and small optimization modes, the given `safety_checks_hint` is ignored and is always treated as `.assumed_correct`.
 const safety_checks_hint: union(enum) {
     /// Rounded up to the nearest multiple of 8.
     checked_to_fixed_depth: usize,
@@ -133,7 +133,7 @@ pub fn endObject(self: *Stringify) Error!void {
 fn pushIndentation(self: *Stringify, mode: IndentationMode) !void {
     switch (safety_checks) {
         .checked_to_fixed_depth => {
-            BitStack.pushWithStateAssumeCapacity(&self.nesting_stack, &self.indent_level, @intFromEnum(mode));
+            BitStack.pushWithStateAssumeCapacity(&self.nesting_stack, &self.indent_level, @backingInt(mode));
         },
         .assumed_correct => {
             self.indent_level += 1;
@@ -143,7 +143,7 @@ fn pushIndentation(self: *Stringify, mode: IndentationMode) !void {
 fn popIndentation(self: *Stringify, expected_mode: IndentationMode) void {
     switch (safety_checks) {
         .checked_to_fixed_depth => {
-            assert(BitStack.popWithState(&self.nesting_stack, &self.indent_level) == @intFromEnum(expected_mode));
+            assert(BitStack.popWithState(&self.nesting_stack, &self.indent_level) == @backingInt(expected_mode));
         },
         .assumed_correct => {
             self.indent_level -= 1;
@@ -208,7 +208,7 @@ fn valueDone(self: *Stringify) void {
 fn isObjectKeyExpected(self: *const Stringify) ?bool {
     switch (safety_checks) {
         .checked_to_fixed_depth => return self.indent_level > 0 and
-            BitStack.peekWithState(&self.nesting_stack, self.indent_level) == @intFromEnum(IndentationMode.object) and
+            BitStack.peekWithState(&self.nesting_stack, self.indent_level) == @backingInt(IndentationMode.object) and
             self.next_punctuation != .colon,
         .assumed_correct => return null,
     }
@@ -250,8 +250,8 @@ test print {
         \\  a: [  ],
         \\  b: [
         \\    [[]] ,
-        \\      12345
-        \\  ]
+        \\      12345,
+        \\  ],
         \\}
     ;
     try std.testing.expectEqualStrings(expected, out.buffered());
@@ -411,13 +411,13 @@ pub fn write(self: *Stringify, v: anytype) Error!void {
                 return v.jsonStringify(self);
             }
 
-            if (!enum_info.is_exhaustive) {
-                inline for (enum_info.fields) |field| {
-                    if (v == @field(T, field.name)) {
+            if (enum_info.mode == .nonexhaustive) {
+                inline for (enum_info.field_names) |field_name| {
+                    if (v == @field(T, field_name)) {
                         break;
                     }
                 } else {
-                    return self.write(@intFromEnum(v));
+                    return self.write(@backingInt(v));
                 }
             }
 
@@ -434,15 +434,15 @@ pub fn write(self: *Stringify, v: anytype) Error!void {
             const info = @typeInfo(T).@"union";
             if (info.tag_type) |UnionTagType| {
                 try self.beginObject();
-                inline for (info.fields) |u_field| {
-                    if (v == @field(UnionTagType, u_field.name)) {
-                        try self.objectField(u_field.name);
-                        if (u_field.type == void) {
+                inline for (info.field_names, info.field_types) |u_field_name, u_field_type| {
+                    if (v == @field(UnionTagType, u_field_name)) {
+                        try self.objectField(u_field_name);
+                        if (u_field_type == void) {
                             // void v is {}
                             try self.beginObject();
                             try self.endObject();
                         } else {
-                            try self.write(@field(v, u_field.name));
+                            try self.write(@field(v, u_field_name));
                         }
                         break;
                     }
@@ -465,16 +465,16 @@ pub fn write(self: *Stringify, v: anytype) Error!void {
             } else {
                 try self.beginObject();
             }
-            inline for (S.fields) |Field| {
+            inline for (S.field_names, S.field_types) |field_name, field_type| {
                 // don't include void fields
-                if (Field.type == void) continue;
+                if (field_type == void) continue;
 
                 var emit_field = true;
 
                 // don't include optional fields that are null when emit_null_optional_fields is set to false
-                if (@typeInfo(Field.type) == .optional) {
+                if (@typeInfo(field_type) == .optional) {
                     if (self.options.emit_null_optional_fields == false) {
-                        if (@field(v, Field.name) == null) {
+                        if (@field(v, field_name) == null) {
                             emit_field = false;
                         }
                     }
@@ -482,9 +482,9 @@ pub fn write(self: *Stringify, v: anytype) Error!void {
 
                 if (emit_field) {
                     if (!S.is_tuple) {
-                        try self.objectField(Field.name);
+                        try self.objectField(field_name);
                     }
-                    try self.write(@field(v, Field.name));
+                    try self.write(@field(v, field_name));
                 }
             }
             if (S.is_tuple) {
@@ -593,36 +593,37 @@ pub fn value(v: anytype, options: Options, writer: *Writer) Error!void {
 }
 
 test value {
-    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    var out: Writer.Allocating = .init(std.testing.allocator);
     const writer = &out.writer;
     defer out.deinit();
 
     const T = struct { a: i32, b: []const u8 };
     try value(T{ .a = 123, .b = "xy" }, .{}, writer);
-    try std.testing.expectEqualSlices(u8, "{a:123,b:\"xy\"}", out.written());
+    try std.testing.expectEqualSlices(u8, "{a:123,b:\"xy\",}", out.written());
 
     try testStringify("9999999999999999", 9999999999999999, .{});
     try testStringify("\"9999999999999999\"", 9999999999999999, .{ .emit_nonportable_numbers_as_strings = true });
 
-    try testStringify("[1,1]", @as(@Vector(2, u32), @splat(1)), .{});
+    try testStringify("[1,1,]", @as(@Vector(2, u32), @splat(1)), .{});
     try testStringify("\"AA\"", @as(@Vector(2, u8), @splat('A')), .{});
-    try testStringify("[65,65]", @as(@Vector(2, u8), @splat('A')), .{ .emit_strings_as_arrays = true });
+    try testStringify("[65,65,]", @as(@Vector(2, u8), @splat('A')), .{ .emit_strings_as_arrays = true });
 
     // void field
-    try testStringify("{foo:42}", struct {
+    try testStringify("{foo:42,}", struct {
         foo: u32,
         bar: void = {},
     }{ .foo = 42 }, .{});
 
     const Tuple = struct { []const u8, usize };
-    try testStringify("[\"foo\",42]", Tuple{ "foo", 42 }, .{
+    try testStringify("[\"foo\",42,]", Tuple{ "foo", 42 }, .{
         .emit_quoted_keys = true,
     });
 
+    // JSON5 allows trailing comma
     comptime {
         testStringify("false", false, .{}) catch unreachable;
         const MyStruct = struct { foo: u32 };
-        testStringify("[{foo:42},{foo:100},{foo:1000}]", [_]MyStruct{
+        testStringify("[{foo:42,},{foo:100,},{foo:1000,},]", [_]MyStruct{
             MyStruct{ .foo = 42 },
             MyStruct{ .foo = 100 },
             MyStruct{ .foo = 1000 },
@@ -635,7 +636,7 @@ test value {
 ///
 /// Caller owns returned memory.
 pub fn valueAlloc(gpa: Allocator, v: anytype, options: Options) error{OutOfMemory}![]u8 {
-    var aw: std.Io.Writer.Allocating = .init(gpa);
+    var aw: Writer.Allocating = .init(gpa);
     defer aw.deinit();
     value(v, options, &aw.writer) catch return error.OutOfMemory;
     return aw.toOwnedSlice();
@@ -644,7 +645,7 @@ pub fn valueAlloc(gpa: Allocator, v: anytype, options: Options) error{OutOfMemor
 test valueAlloc {
     const allocator = std.testing.allocator;
     const expected =
-        \\{foo:"bar",answer:42,my_friend:"sammy"}
+        \\{foo:"bar",answer:42,my_friend:"sammy",}
     ;
     const actual = try valueAlloc(allocator, .{ .foo = "bar", .answer = 42, .my_friend = "sammy" }, .{});
     defer allocator.free(actual);
@@ -773,25 +774,25 @@ fn testBasicWriteStream(w: *Stringify) !void {
         \\{
         \\  object: {
         \\    one: 1,
-        \\    two: 2
+        \\    two: 2,
         \\  },
         \\  string: "This is a string",
         \\  array: [
         \\    "Another string",
         \\    1,
-        \\    3.5
+        \\    3.5,
         \\  ],
         \\  int: 10,
-        \\  float: 3.5
+        \\  float: 3.5,
         \\}
     ;
     try std.testing.expectEqualStrings(expected, w.writer.buffered());
 }
 
 fn getJsonObject(allocator: std.mem.Allocator) !std.json.Value {
-    var v: std.json.Value = .{ .object = std.json.ObjectMap.init(allocator) };
-    try v.object.put("one", std.json.Value{ .integer = @as(i64, @intCast(1)) });
-    try v.object.put("two", std.json.Value{ .float = 2.0 });
+    var v: std.json.Value = .{ .object = .empty };
+    try v.object.put(allocator, "one", std.json.Value{ .integer = @as(i64, @intCast(1)) });
+    try v.object.put(allocator, "two", std.json.Value{ .float = 2.0 });
     return v;
 }
 
@@ -803,13 +804,13 @@ test "stringify null optional fields" {
         another_required: []const u8 = "something else",
     };
     try testStringify(
-        \\{optional:null,required:"something",another_optional:null,another_required:"something else"}
+        \\{optional:null,required:"something",another_optional:null,another_required:"something else",}
     ,
         MyStruct{},
         .{},
     );
     try testStringify(
-        \\{required:"something",another_required:"something else"}
+        \\{required:"something",another_required:"something else",}
     ,
         MyStruct{},
         .{ .emit_null_optional_fields = false },
@@ -877,7 +878,7 @@ test "stringify non-exhaustive enum" {
         _,
     };
     try testStringify("\"foo\"", E.foo, .{});
-    try testStringify("1", @as(E, @enumFromInt(1)), .{});
+    try testStringify("1", @as(E, @fromBackingInt(@intCast(1))), .{});
 }
 
 test "stringify enum literals" {
@@ -891,29 +892,29 @@ test "stringify tagged unions" {
         foo: u32,
         bar: bool,
     };
-    try testStringify("{nothing:{}}", T{ .nothing = {} }, .{});
-    try testStringify("{foo:42}", T{ .foo = 42 }, .{});
-    try testStringify("{bar:true}", T{ .bar = true }, .{});
+    try testStringify("{nothing:{},}", T{ .nothing = {} }, .{});
+    try testStringify("{foo:42,}", T{ .foo = 42 }, .{});
+    try testStringify("{bar:true,}", T{ .bar = true }, .{});
 }
 
 test "stringify struct" {
-    try testStringify("{foo:42}", struct {
+    try testStringify("{foo:42,}", struct {
         foo: u32,
     }{ .foo = 42 }, .{});
 }
 
 test "emit_strings_as_arrays" {
     // Should only affect string values, not object keys.
-    try testStringify("{foo:\"bar\"}", .{ .foo = "bar" }, .{});
-    try testStringify("{foo:[98,97,114]}", .{ .foo = "bar" }, .{ .emit_strings_as_arrays = true });
+    try testStringify("{foo:\"bar\",}", .{ .foo = "bar" }, .{});
+    try testStringify("{foo:[98,97,114,],}", .{ .foo = "bar" }, .{ .emit_strings_as_arrays = true });
     // Should *not* affect these types:
     try testStringify("\"foo\"", @as(enum { foo, bar }, .foo), .{ .emit_strings_as_arrays = true });
     try testStringify("\"ItBroke\"", error.ItBroke, .{ .emit_strings_as_arrays = true });
     // Should work on these:
     try testStringify("\"bar\"", @Vector(3, u8){ 'b', 'a', 'r' }, .{});
-    try testStringify("[98,97,114]", @Vector(3, u8){ 'b', 'a', 'r' }, .{ .emit_strings_as_arrays = true });
+    try testStringify("[98,97,114,]", @Vector(3, u8){ 'b', 'a', 'r' }, .{ .emit_strings_as_arrays = true });
     try testStringify("\"bar\"", [3]u8{ 'b', 'a', 'r' }, .{});
-    try testStringify("[98,97,114]", [3]u8{ 'b', 'a', 'r' }, .{ .emit_strings_as_arrays = true });
+    try testStringify("[98,97,114,]", [3]u8{ 'b', 'a', 'r' }, .{ .emit_strings_as_arrays = true });
 }
 
 test "stringify struct with indentation" {
@@ -923,8 +924,8 @@ test "stringify struct with indentation" {
         \\    bar: [
         \\        1,
         \\        2,
-        \\        3
-        \\    ]
+        \\        3,
+        \\    ],
         \\}
     ,
         struct {
@@ -937,7 +938,7 @@ test "stringify struct with indentation" {
         .{ .whitespace = .indent_4 },
     );
     try testStringify(
-        "{\n\tfoo: 42,\n\tbar: [\n\t\t1,\n\t\t2,\n\t\t3\n\t]\n}",
+        "{\n\tfoo: 42,\n\tbar: [\n\t\t1,\n\t\t2,\n\t\t3,\n\t],\n}",
         struct {
             foo: u32,
             bar: [3]u32,
@@ -948,7 +949,7 @@ test "stringify struct with indentation" {
         .{ .whitespace = .indent_tab },
     );
     try testStringify(
-        \\{foo:42,bar:[1,2,3]}
+        \\{foo:42,bar:[1,2,3,],}
     ,
         struct {
             foo: u32,
@@ -965,7 +966,7 @@ test "stringify array of structs" {
     const MyStruct = struct {
         foo: u32,
     };
-    try testStringify("[{foo:42},{foo:100},{foo:1000}]", [_]MyStruct{
+    try testStringify("[{foo:42,},{foo:100,},{foo:1000,},]", [_]MyStruct{
         MyStruct{ .foo = 42 },
         MyStruct{ .foo = 100 },
         MyStruct{ .foo = 1000 },
@@ -973,7 +974,7 @@ test "stringify array of structs" {
 }
 
 test "stringify struct with custom stringifier" {
-    try testStringify("[\"something special\",42]", struct {
+    try testStringify("[\"something special\",42,]", struct {
         foo: u32,
         const Self = @This();
         pub fn jsonStringify(v: @This(), jws: anytype) !void {
@@ -1011,7 +1012,7 @@ test "raw streaming" {
 
     const expected =
         \\{
-        \\  "long key": "long value"
+        \\  "long key": "long value",
         \\}
     ;
     try std.testing.expectEqualStrings(expected, w.writer.buffered());

@@ -1,12 +1,12 @@
 //! JSON parsing and stringification conforming to RFC 8259. https://datatracker.ietf.org/doc/html/rfc8259
 //!
 //! The low-level `Scanner` API produces `Token`s from an input slice or successive slices of inputs,
-//! The `Reader` API connects a `std.io.GenericReader` to a `Scanner`.
+//! The `Reader` API connects a `std.Io.Reader` to a `Scanner`.
 //!
 //! The high-level `parseFromSlice` and `parseFromTokenSource` deserialize a JSON document into a Zig type.
 //! Parse into a dynamically-typed `Value` to load any JSON value for runtime inspection.
 //!
-//! The low-level `writeStream` emits syntax-conformant JSON tokens to a `std.io.GenericWriter`.
+//! The low-level `writeStream` emits syntax-conformant JSON tokens to a `std.Io.Writer`.
 //! The high-level `stringify` serializes a Zig or `Value` type into JSON.
 
 const builtin = @import("builtin");
@@ -42,7 +42,7 @@ test Stringify {
     try write_stream.endObject();
     const expected =
         \\{
-        \\  foo: 123
+        \\  foo: 123,
         \\}
     ;
     try testing.expectEqualSlices(u8, expected, out.written());
@@ -90,7 +90,7 @@ test fmt {
     const expectFmt = std.testing.expectFmt;
     try expectFmt("123", "{f}", .{fmt(@as(u32, 123), .{})});
     try expectFmt(
-        \\{num:927,msg:"hello",sub:{mybool:true}}
+        \\{num:927,msg:"hello",sub:{mybool:true,},}
     , "{f}", .{fmt(struct {
         num: u32,
         msg: []const u8,
